@@ -1,0 +1,5 @@
+fastapi
+uvicorn[standard]
+telethon
+python-dotenv
+cryptography
