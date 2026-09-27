@@ -1,13 +1,18 @@
 import os
 import base64
 import json
+import hmac
+import re
+import time
 import urllib.error
 import urllib.request
+from collections import defaultdict, deque
 from typing import Dict
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 from cryptography.fernet import Fernet
 from telethon import TelegramClient, functions, types, utils
 from telethon.sessions import StringSession
@@ -49,6 +54,29 @@ cipher = Fernet(os.environ["SESSION_ENCRYPTION_KEY"].encode())
 
 app = FastAPI(title="TeleRelay Base44 Telegram Bridge")
 
+# Security defaults: the browser should not call this bridge directly.
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get("ALLOWED_ORIGINS", "").split(",")
+    if origin.strip()
+]
+if ALLOWED_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=ALLOWED_ORIGINS,
+        allow_credentials=False,
+        allow_methods=["GET", "POST"],
+        allow_headers=["X-API-Key", "Content-Type"],
+    )
+
+MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", "65536"))
+RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", "60"))
+RATE_LIMIT_REQUESTS = int(os.environ.get("RATE_LIMIT_REQUESTS", "60"))
+LOGIN_RATE_LIMIT_REQUESTS = int(os.environ.get("LOGIN_RATE_LIMIT_REQUESTS", "5"))
+PENDING_LOGIN_TTL = int(os.environ.get("PENDING_LOGIN_TTL", "600"))
+
+_rate_events = defaultdict(deque)
+
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 GITHUB_REPO = os.environ.get(
     "GITHUB_REPO",
@@ -66,6 +94,51 @@ sessions: Dict[str, str] = {}
 clients: Dict[str, SafeTelegramClient] = {}
 pending_logins: Dict[str, dict] = {}
 github_file_sha: str | None = None
+
+
+@app.middleware("http")
+async def security_middleware(request: Request, call_next):
+    if request.method in {"POST", "PUT", "PATCH"}:
+        content_length = request.headers.get("content-length")
+        if content_length and int(content_length) > MAX_BODY_BYTES:
+            raise HTTPException(status_code=413, detail="Request too large")
+
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    return response
+
+
+def _rate_limit(key: str, limit: int) -> None:
+    now = time.monotonic()
+    events = _rate_events[key]
+    while events and now - events[0] > RATE_LIMIT_WINDOW:
+        events.popleft()
+    if len(events) >= limit:
+        raise HTTPException(status_code=429, detail="Too many requests")
+    events.append(now)
+
+
+def _validate_user_id(user_id: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", user_id):
+        raise HTTPException(status_code=400, detail="Invalid user_id")
+    return user_id
+
+
+def _cleanup_pending_login(user_id: str) -> dict | None:
+    pending = pending_logins.get(user_id)
+    if not pending:
+        return None
+    created_at = float(pending.get("created_at", 0))
+    if created_at <= 0 or time.time() - created_at > PENDING_LOGIN_TTL:
+        pending_logins.pop(user_id, None)
+        clients.pop(user_id, None)
+        _save_sessions_safely()
+        return None
+    return pending
 
 
 def _github_request(method: str, url: str, body: bytes | None = None):
@@ -182,30 +255,37 @@ _load_sessions()
 
 
 class LoginStart(BaseModel):
-    user_id: str
-    phone: str
+    user_id: str = Field(min_length=1, max_length=128)
+    phone: str = Field(min_length=5, max_length=32)
 
 
 class LoginVerify(BaseModel):
-    user_id: str
-    code: str
+    user_id: str = Field(min_length=1, max_length=128)
+    code: str = Field(min_length=1, max_length=32)
 
 
 class TwoFactorVerify(BaseModel):
-    user_id: str
-    password: str
+    user_id: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=1, max_length=256)
 
 
 class ForwardRequest(BaseModel):
-    user_id: str
+    user_id: str = Field(min_length=1, max_length=128)
     source_chat_id: int
     message_id: int
-    destination_chat_ids: list[int]
+    destination_chat_ids: list[int] = Field(min_length=1, max_length=20)
 
 
 def check_api_key(api_key: str | None):
-    if api_key != BRIDGE_API_KEY:
+    if not api_key or not hmac.compare_digest(api_key, BRIDGE_API_KEY):
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def authorize_request(api_key: str | None, user_id: str, *, login_endpoint: bool = False):
+    check_api_key(api_key)
+    user_id = _validate_user_id(user_id)
+    _rate_limit(f"user:{user_id}", LOGIN_RATE_LIMIT_REQUESTS if login_endpoint else RATE_LIMIT_REQUESTS)
+    return user_id
 
 
 def _new_client(session_string: str | None = None) -> SafeTelegramClient:
@@ -248,7 +328,11 @@ async def root():
     return {
         "status": "online",
         "service": "TeleRelay Base44 Telegram Bridge",
+        "mode": "read_forward_only",
         "persistent_sessions": bool(GITHUB_TOKEN),
+        "chat_creation": False,
+        "chat_deletion": False,
+        "message_deletion": False,
     }
 
 
@@ -257,7 +341,7 @@ async def login_start(
     request: LoginStart,
     x_api_key: str | None = Header(default=None),
 ):
-    check_api_key(x_api_key)
+    authorize_request(x_api_key, request.user_id, login_endpoint=True)
 
     if request.user_id in sessions:
         client = clients.get(request.user_id)
@@ -294,6 +378,7 @@ async def login_start(
         "session_string": client.session.save(),
         "phone": request.phone,
         "phone_code_hash": sent.phone_code_hash,
+        "created_at": time.time(),
     }
     _save_sessions_safely()
 
@@ -305,10 +390,10 @@ async def login_verify(
     request: LoginVerify,
     x_api_key: str | None = Header(default=None),
 ):
-    check_api_key(x_api_key)
+    authorize_request(x_api_key, request.user_id, login_endpoint=True)
 
     client = clients.get(request.user_id)
-    pending = pending_logins.get(request.user_id)
+    pending = _cleanup_pending_login(request.user_id)
 
     if client is None and pending:
         session_string = pending.get("session_string")
@@ -376,10 +461,10 @@ async def login_2fa(
     request: TwoFactorVerify,
     x_api_key: str | None = Header(default=None),
 ):
-    check_api_key(x_api_key)
+    authorize_request(x_api_key, request.user_id, login_endpoint=True)
 
     client = clients.get(request.user_id)
-    pending = pending_logins.get(request.user_id)
+    pending = _cleanup_pending_login(request.user_id)
 
     if client is None and pending:
         session_string = pending.get("session_string")
@@ -521,7 +606,7 @@ async def telegram_status(
     user_id: str,
     x_api_key: str | None = Header(default=None),
 ):
-    check_api_key(x_api_key)
+    authorize_request(x_api_key, user_id) 
 
     if user_id not in sessions:
         return {"connected": False}
@@ -546,7 +631,7 @@ async def get_folders(
     user_id: str,
     x_api_key: str | None = Header(default=None),
 ):
-    check_api_key(x_api_key)
+    authorize_request(x_api_key, user_id)
     client = await get_client(user_id)
 
     result = await client(functions.messages.GetDialogFiltersRequest())
@@ -575,7 +660,7 @@ async def get_chats(
     limit: int | None = None,
     x_api_key: str | None = Header(default=None),
 ):
-    check_api_key(x_api_key)
+    authorize_request(x_api_key, user_id)
     client = await get_client(user_id)
 
     requested_limit = None if limit is None else max(1, min(limit, 200))
@@ -627,8 +712,9 @@ async def get_messages(
     check_api_key(x_api_key)
     client = await get_client(user_id)
 
+    safe_limit = max(1, min(limit, 100))
     messages = []
-    async for message in client.iter_messages(chat_id, limit=max(1, min(limit, 100))):
+    async for message in client.iter_messages(chat_id, limit=safe_limit):
         messages.append({
             "id": message.id,
             "text": message.text or "",
@@ -644,11 +730,11 @@ async def forward_message(
     request: ForwardRequest,
     x_api_key: str | None = Header(default=None),
 ):
-    check_api_key(x_api_key)
+    authorize_request(x_api_key, request.user_id)
     client = await get_client(request.user_id)
 
     results = []
-    for destination in request.destination_chat_ids:
+    for destination in request.destination_chat_ids[:20]:
         try:
             await client.forward_messages(
                 destination,
@@ -674,8 +760,7 @@ async def logout(
     user_id: str,
     x_api_key: str | None = Header(default=None),
 ):
-    check_api_key(x_api_key)
-
+    authorize_request(x_api_key, user_id)
     client = clients.pop(user_id, None)
     if client:
         await client.log_out()
