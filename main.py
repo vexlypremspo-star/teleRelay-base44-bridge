@@ -663,7 +663,7 @@ async def get_chats(
     authorize_request(x_api_key, user_id)
     client = await get_client(user_id)
 
-    requested_limit = None if limit is None else max(1, min(limit, 200))
+    requested_limit = None if limit is None else max(1, min(limit, 5000))
 
     if folder_id in (0, 1):
         dialogs = [
